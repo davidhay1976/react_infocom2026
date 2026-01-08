@@ -1,0 +1,233 @@
+// lucid implementation of rotating bloom filters (based on conquest)
+// we have a series of bloom filters, each of which represents a measurement interval of T nanoseconds
+
+
+extern forwarded(int<16> id, int src, int dst, int<48> timestamp);
+extern dropped(int<16> id, int src, int dst, int<48> timestamp);
+extern track_reqs(int<16> id, int src, int dst, int<48> timestamp);
+extern check_if_need_to_retransmit(int<16> id, int src, int dst, int<48> timestamp);
+extern write_to_file();
+extern write_retransmissions_to_file();
+extern count_broadcasts();
+extern count_installs();
+
+/* Arrays */
+global Array.t<32> reg_cleaning_index = Array.create(1);
+
+global Array.t<1> snap_0_row_0 = Array.create(131072);
+global Array.t<1> snap_0_row_1 = Array.create(131072);
+global Array.t<1> snap_1_row_0 = Array.create(131072);
+global Array.t<1> snap_1_row_1 = Array.create(131072);
+global Array.t<1> snap_2_row_0 = Array.create(131072);
+global Array.t<1> snap_2_row_1 = Array.create(131072);
+global Array.t<1> snap_3_row_0 = Array.create(131072);
+global Array.t<1> snap_3_row_1 = Array.create(131072);
+
+/* Actions */
+action int<9> out_port(int<9> p)() {
+    return p;
+}
+
+/* Tables */
+global Table.t<<int, int<9>, (), int<9> >> forwarding_table = Table.create(1048576, [out_port], out_port, 0);
+
+// key value store array (must be defined after table bc ordering constraint)
+global Array.t<32> forwarded_reqs_times = Array.create(2048);
+global Array.t<9> forwarded_reqs = Array.create(2048);
+
+
+/* Events */
+// pkt in
+packet event ip_pkt (int<16> transaction_id, int ip_src, int ip_dst, int<48> global_time, int<16> pkttype, int<8> asymmetric_mark);
+// install table value
+event do_install(int addr);
+
+/* Memops */
+memop incr_cleaning(int memval, int incrval) {
+    return memval+incrval;
+}
+
+memop set_bloom(int<1> memval, int<1> incrval) {
+    return incrval;
+}
+
+memop get_bloom(int<1> memval, int<1> incrval) {
+    return memval;
+}
+
+memop checktime(int memval, int newval) {
+    if (newval-memval > 1000000000) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+/* Handlers */
+// add entry into forwarding table
+handle do_install(int addr){
+    // printf("DO INSTALL");
+    Table.install(forwarding_table, addr, out_port, ingress_port);	
+    // skip;
+}
+
+// type of variables? not all have to be 32-bit ints
+// pkttype 0 is DNS request, 1 is response
+handle ip_pkt (int<16> transaction_id, int ip_src, int ip_dst, int<48> global_time, int<16> pkttype, int<8> asymmetric_mark) {
+    if (pkttype == 9) {    // this is a dummy pkt, at the end of a step of our simulation
+        write_retransmissions_to_file();
+        write_to_file();
+    }
+    printf("ID: %d", transaction_id);
+    printf("PKT TYPE: %d", pkttype);
+	// get epoch to decide which snaps we read/write/clean
+    int<2> snap_epoch = hash<2>(1, global_time[33:32]);
+
+    
+    int<2> writing_epoch = snap_epoch + 3;
+
+    //calc_cleaning_index
+    int c_i = Array.update(reg_cleaning_index, 0, incr_cleaning, 1, incr_cleaning, 1);
+    int<17> clean_index = (int<17>)c_i;
+    printf("CLEAN_INDEX: %d", clean_index);
+
+    // calc hashes for reading/writing
+    int<17> row_0_idx = 0;
+    int<17> row_1_idx = 0;
+    int<11> kvs_key = hash<11>(size_to_int(0), transaction_id);
+    // ordering matters for hash, so need to 
+    if (pkttype == 0) {  // request
+        row_0_idx = hash<17>(size_to_int(3), transaction_id, ip_src, ip_dst);
+        row_1_idx = hash<17>(size_to_int(4), transaction_id, ip_src, ip_dst);
+
+    } else {    // response
+        row_0_idx = hash<17>(size_to_int(3), transaction_id, ip_dst, ip_src);
+        row_1_idx = hash<17>(size_to_int(4), transaction_id, ip_dst, ip_src);
+    }
+    // epoch behavior:
+    // epoch = 0 -> cleaning 0, writing 3, reading 1, 2
+    // epoch = 1 -> cleaning 1, writing 0, reading 2, 3
+    // epoch = 2 -> cleaning 2, writing 1, reading 0, 3
+    // epoch = 3 -> cleaning 3, writing 2, reading 0, 1
+    int<1> readval_0 = 0;
+    int<1> readval_1 = 0;
+    int<1> readval_2 = 0;
+    int<1> readval_3 = 0;
+    int<1> readval_4 = 0;
+    int<1> readval_5 = 0;
+
+    int<1> setval = 0;
+
+    if (pkttype==0) {
+        setval = 1;
+    }
+
+
+    if (snap_epoch == 0) {
+        Array.set(snap_0_row_0, clean_index, 0);
+        Array.set(snap_0_row_1, clean_index, 0);
+        readval_0 = Array.get(snap_1_row_0, row_0_idx);
+        readval_1 = Array.get(snap_1_row_1, row_1_idx);
+        readval_2 = Array.get(snap_2_row_0, row_0_idx);
+        readval_3 = Array.get(snap_2_row_1, row_1_idx);
+        readval_4 = Array.update(snap_3_row_0, row_0_idx, get_bloom, 0, set_bloom, setval);
+        readval_5 = Array.update(snap_3_row_1, row_1_idx, get_bloom, 0, set_bloom, setval);
+    }
+    else if (snap_epoch == 1) {
+        readval_4 = Array.update(snap_0_row_0, row_0_idx, get_bloom, 0, set_bloom, setval);
+        readval_5 = Array.update(snap_0_row_1, row_1_idx, get_bloom, 0, set_bloom, setval);
+        Array.set(snap_1_row_0, clean_index, 0);
+        Array.set(snap_1_row_1, clean_index, 0);
+        readval_0 = Array.get(snap_2_row_0, row_0_idx);
+        readval_1 = Array.get(snap_2_row_1, row_1_idx);
+        readval_2 = Array.get(snap_3_row_0, row_0_idx);
+        readval_3 = Array.get(snap_3_row_1, row_1_idx);
+    }
+    else if (snap_epoch == 2) {
+        readval_0 = Array.get(snap_0_row_0, row_0_idx);
+        readval_1 = Array.get(snap_0_row_1, row_1_idx);
+        readval_4 = Array.update(snap_1_row_0, row_0_idx, get_bloom, 0, set_bloom, setval);
+        readval_5 = Array.update(snap_1_row_1, row_1_idx, get_bloom, 0, set_bloom, setval);
+        Array.set(snap_2_row_0, clean_index, 0);
+        Array.set(snap_2_row_1, clean_index, 0);
+        readval_2 = Array.get(snap_3_row_0, row_0_idx);
+        readval_3 = Array.get(snap_3_row_1, row_1_idx);  
+    }
+
+    else if (snap_epoch == 3) {
+        readval_0 = Array.get(snap_0_row_0, row_0_idx);
+        readval_1 = Array.get(snap_0_row_1, row_1_idx);
+        readval_2 = Array.get(snap_1_row_0, row_0_idx);
+        readval_3 = Array.get(snap_1_row_1, row_1_idx);
+        readval_4 = Array.update(snap_2_row_0, row_0_idx, get_bloom, 0, set_bloom, setval);
+        readval_5 = Array.update(snap_2_row_1, row_1_idx, get_bloom, 0, set_bloom, setval);
+        Array.set(snap_3_row_0, clean_index, 0);
+        Array.set(snap_3_row_1, clean_index, 0);    
+    }
+
+    int<1> found0 = readval_0 & readval_1;
+    int<1> found1 = readval_2 & readval_3;
+    int<1> found2 = readval_4 & readval_5;
+    int<1> found3 = found0 | found1;
+    int<1> found = found2 | found3;
+    printf("FOUND: %d", found);
+    int<9> switch_port = 0;
+
+
+    if (pkttype == 0) { // this is a request
+        track_reqs(transaction_id, ip_src, ip_dst, global_time);
+        if (found != 0) {   // we have a match in the bloom filters
+            if (asymmetric_mark == 0) { // mark is null - this isn't from another switch
+                // this is a retransmitted request
+                // broadcast request to all switches
+                printf("RETRANSMITTED REQ, BROADCAST");
+                generate_port(2, ip_pkt(transaction_id, ip_src, ip_dst, global_time, pkttype, 1)); 
+                count_broadcasts();
+            }
+        }
+        else {  // this is a new request (not a retransmission)
+            // check forwarding table; if match, duplicate and send to specifc switch id/port
+            if (asymmetric_mark == 0) {    // this is not a broadcasted request
+                int<9> port_in_table = Table.lookup(forwarding_table, ip_src, ());
+                if (port_in_table != 0) {
+                    generate_port(port_in_table, ip_pkt(transaction_id, ip_src, ip_dst, global_time, pkttype, 2));  // duplicate and send to specific switch
+                }
+                generate_port(3, ip_pkt(transaction_id, ip_src, ip_dst, global_time, pkttype, 0));  // always forward to DNS server
+            }
+        }
+        if (asymmetric_mark == 1) {  // mark is broadcast (this is broadcasted to us from a switch)
+            // insert into key value store
+            Array.set(forwarded_reqs_times, kvs_key, global_time[31:0]);
+            Array.set(forwarded_reqs, kvs_key, ingress_port);
+        }
+    }
+
+    else {  // this is a response
+        if (found != 0) { // we have the matching req, send to client
+            printf("FORWARD RESPONSE");
+            generate_port(1, ip_pkt(transaction_id, ip_src, ip_dst, global_time, pkttype, 0));
+            forwarded(transaction_id, ip_src, ip_dst, global_time);
+        }
+        else { // we have no idea where request came from, so we drop the response
+            printf("DROPPING RESPONSE");
+            dropped(transaction_id, ip_src, ip_dst, global_time);
+            check_if_need_to_retransmit(transaction_id, ip_src, ip_dst, global_time);
+        }
+        int timeout = Array.getm(forwarded_reqs_times, kvs_key, checktime, global_time[31:0]);
+        if (timeout == 1) {
+            Array.set(forwarded_reqs, kvs_key, 0);
+        }
+        else {
+            int<9> switch_value = Array.get(forwarded_reqs, kvs_key);  // check if we find this in our KVS
+            if (switch_value != 0) {
+                // printf("FOUND IN KVS (send update to upstream)");
+                // send update to upstream switch
+                generate_port(switch_value, do_install(ip_dst));
+                count_installs();
+            }
+        }
+            
+    }
+
+}
+
