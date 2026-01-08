@@ -1,0 +1,14 @@
+{
+    "switches": 2,
+    "links": {
+        "0:2": "1:2"
+    },
+    "max time": 99999999999,
+    "default input gap": 100,
+    "random seed": 0,
+    "python file": "react.py",
+    "generate delay": 2,
+    "events": [
+
+    ]
+}
